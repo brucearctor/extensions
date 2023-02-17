@@ -1,3 +1,27 @@
+## Version 0.1.34
+
+feature - upgrade extensions to the latest firebase-admin sdk
+
+fixed - support backfill task in custom region
+
+feature - add description to the failedImagesPath param
+
+feature - put failed resizes in separate directory #563
+
+## Version 0.1.33
+
+fixed - re-add input object data to the complete event
+
+## Version 0.1.32
+
+feature - added lifecycle event to resize existing images
+
+## Version 0.1.31
+
+feature - add AVIF codec support
+
+feature - update IMG_BUCKET param type to selectResource
+
 ## Version 0.1.30
 
 feature - include original image data in events

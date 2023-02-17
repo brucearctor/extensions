@@ -22,6 +22,7 @@ import {
   RawChangelogSchema,
   RawChangelogViewSchema,
   documentIdField,
+  oldDataField,
   documentPathParams,
 } from "./schema";
 import { latestConsistentSnapshotView } from "./snapshot";
@@ -57,6 +58,7 @@ export interface FirestoreBigQueryEventHistoryTrackerConfig {
   wildcardIds?: boolean;
   bqProjectId?: string | undefined;
   backupTableId?: string | undefined;
+  useNewSnapshotQuerySyntax?: boolean;
 }
 
 /**
@@ -113,7 +115,9 @@ export class FirestoreBigQueryEventHistoryTracker
         },
       };
     });
+
     const transformedRows = await this.transformRows(rows);
+
     await this.insertData(transformedRows);
   }
 
@@ -173,9 +177,9 @@ export class FirestoreBigQueryEventHistoryTracker
       e.response.insertErrors.errors
     ) {
       const errors = e.response.insertErrors.errors;
-      errors.forEach((error) => {
+      errors?.forEach((error) => {
         let isExpected = false;
-        expectedErrors.forEach((expectedError) => {
+        expectedErrors?.forEach((expectedError) => {
           if (
             error.message === expectedError.message &&
             error.location === expectedError.location
@@ -251,7 +255,7 @@ export class FirestoreBigQueryEventHistoryTracker
         );
       }
 
-      // Exceeded number of retires, save in failed collection
+      // Exceeded number of retries, save in failed collection
       if (!retry && this.config.backupTableId) {
         await handleFailedTransactions(rows, this.config, e);
       }
@@ -332,6 +336,15 @@ export class FirestoreBigQueryEventHistoryTracker
         (column) => column.name === "path_params"
       );
 
+      const oldDataColExists = fields.find(
+        (column) => column.name === "old_data"
+      );
+
+      if (!oldDataColExists) {
+        fields.push(oldDataField);
+        logs.addNewColumn(this.rawChangeLogTableName(), oldDataField.name);
+      }
+
       if (!documentIdColExists) {
         fields.push(documentIdField);
         logs.addNewColumn(this.rawChangeLogTableName(), documentIdField.name);
@@ -343,19 +356,28 @@ export class FirestoreBigQueryEventHistoryTracker
           documentPathParams.name
         );
       }
-      await partitioning.addPartitioningToSchema(metadata.schema.fields);
 
       /** Updated table metadata if required */
-      const shouldUpdate = await tableRequiresUpdate(
+      const shouldUpdate = await tableRequiresUpdate({
         table,
-        this.config,
-        fields,
+        config: this.config,
         documentIdColExists,
-        pathParamsColExists
-      );
+        pathParamsColExists,
+        oldDataColExists,
+      });
 
       if (shouldUpdate) {
+        /** set partitioning */
+        await partitioning.addPartitioningToSchema(metadata.schema.fields);
+
+        /** update table metadata with changes. */
         await table.setMetadata(metadata);
+        logs.updatingMetadata(this.rawChangeLogTableName(), {
+          config: this.config,
+          documentIdColExists,
+          pathParamsColExists,
+          oldDataColExists,
+        });
       }
     } else {
       logs.bigQueryTableCreating(changelogName);
@@ -397,45 +419,47 @@ export class FirestoreBigQueryEventHistoryTracker
     if (viewExists) {
       logs.bigQueryViewAlreadyExists(view.id, dataset.id);
       const [metadata] = await view.getMetadata();
-      const fields = metadata.schema ? metadata.schema.fields : [];
+      // TODO: just casting this for now, needs properly fixing
+      const fields = (metadata.schema ? metadata.schema.fields : []) as {
+        name: string;
+      }[];
       if (this.config.wildcardIds) {
         schema.fields.push(documentPathParams);
       }
-      const documentIdColExists = fields.find(
-        (column) => column.name === "document_id"
-      );
 
-      const pathParamsColExists = fields.find(
-        (column) => column.name === "path_params"
-      );
+      const columnNames = fields.map((field) => field.name);
+      const documentIdColExists = columnNames.includes("document_id");
+      const pathParamsColExists = columnNames.includes("path_params");
+      const oldDataColExists = columnNames.includes("old_data");
 
-      if (!documentIdColExists) {
-        metadata.view = latestConsistentSnapshotView(
-          this.config.datasetId,
-          this.rawChangeLogTableName(),
-          schema
-        );
-        logs.addNewColumn(this.rawLatestView(), documentIdField.name);
-      }
+      /** If new view or opt-in to new query syntax **/
+      const updateView = viewRequiresUpdate({
+        metadata,
+        config: this.config,
+        documentIdColExists,
+        pathParamsColExists,
+        oldDataColExists,
+      });
 
-      if (!pathParamsColExists && this.config.wildcardIds) {
-        metadata.view = latestConsistentSnapshotView(
-          this.config.datasetId,
-          this.rawChangeLogTableName(),
-          schema
-        );
-        logs.addNewColumn(this.rawLatestView(), documentPathParams.name);
-      }
+      if (updateView) {
+        metadata.view = latestConsistentSnapshotView({
+          datasetId: this.config.datasetId,
+          tableName: this.rawChangeLogTableName(),
+          schema,
+          useLegacyQuery: !this.config.useNewSnapshotQuerySyntax,
+        });
 
-      if (
-        viewRequiresUpdate(
-          this.config,
-          fields,
-          documentIdColExists,
-          pathParamsColExists
-        )
-      ) {
+        if (!documentIdColExists) {
+          logs.addNewColumn(this.rawLatestView(), documentIdField.name);
+        }
+
         await view.setMetadata(metadata);
+        logs.updatingMetadata(this.rawLatestView(), {
+          config: this.config,
+          documentIdColExists,
+          pathParamsColExists,
+          oldDataColExists,
+        });
       }
     } else {
       const schema = { fields: [...RawChangelogViewSchema.fields] };
@@ -443,12 +467,13 @@ export class FirestoreBigQueryEventHistoryTracker
       if (this.config.wildcardIds) {
         schema.fields.push(documentPathParams);
       }
-      const latestSnapshot = latestConsistentSnapshotView(
-        this.config.datasetId,
-        this.rawChangeLogTableName(),
+      const latestSnapshot = latestConsistentSnapshotView({
+        datasetId: this.config.datasetId,
+        tableName: this.rawChangeLogTableName(),
         schema,
-        this.bq.projectId
-      );
+        bqProjectId: this.bq.projectId,
+        useLegacyQuery: !this.config.useNewSnapshotQuerySyntax,
+      });
       logs.bigQueryViewCreating(this.rawLatestView(), latestSnapshot.query);
       const options: TableMetadata = {
         friendlyName: this.rawLatestView(),

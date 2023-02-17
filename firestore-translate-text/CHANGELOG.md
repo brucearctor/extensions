@@ -1,3 +1,13 @@
+## Version 0.1.10
+
+feature - upgrade extensions to the latest firebase-admin sdk
+
+feature - add optional languages field param
+
+## Version 0.1.9
+
+feature - add lifecycle event to translate existing documents in the collection.
+
 ## Version 0.1.8
 
 fixed - generate correct `package-lock.json` files after `lerna bootstrap` (#779)
